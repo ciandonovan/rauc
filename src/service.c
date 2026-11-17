@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "artifacts.h"
+#include "authorize.h"
 #include "bundle.h"
 #include "bootchooser.h"
 #include "config_file.h"
@@ -76,6 +77,68 @@ static void convert_dict_to_bundle_access_args(
 		g_variant_dict_remove(dict, "http-headers");
 }
 
+/*
+ * Only passes whether each was given, as the values can hold credentials.
+ */
+static void add_access_args_details(GPtrArray *details, const RaucBundleAccessArgs *access_args)
+{
+	g_ptr_array_add(details, (gpointer) "tls-no-verify");
+	g_ptr_array_add(details, (gpointer) (access_args->tls_no_verify ? "true" : "false"));
+	g_ptr_array_add(details, (gpointer) "tls-cert");
+	g_ptr_array_add(details, (gpointer) (access_args->tls_cert ? "true" : "false"));
+	g_ptr_array_add(details, (gpointer) "tls-key");
+	g_ptr_array_add(details, (gpointer) (access_args->tls_key ? "true" : "false"));
+	g_ptr_array_add(details, (gpointer) "tls-ca");
+	g_ptr_array_add(details, (gpointer) (access_args->tls_ca ? "true" : "false"));
+	g_ptr_array_add(details, (gpointer) "http-headers");
+	g_ptr_array_add(details, (gpointer) (access_args->http_headers ? "true" : "false"));
+}
+
+static gboolean access_args_overriding(const RaucBundleAccessArgs *access_args)
+{
+	g_return_val_if_fail(access_args, FALSE);
+
+	return access_args->tls_no_verify || access_args->tls_cert ||
+	       access_args->tls_key || access_args->tls_ca ||
+	       access_args->http_headers;
+}
+
+static void install_args_refused(RaucInstallArgs *args)
+{
+	args->status_result = 1;
+	install_args_free(args);
+}
+
+/*
+ * Leaves Operation alone, as it belongs to the method that is running.
+ */
+static void install_reject_busy(GDBusMethodInvocation *invocation, RaucInstallArgs *args)
+{
+	args->status_result = 1;
+	install_args_free(args);
+	g_dbus_method_invocation_return_error(invocation,
+			G_IO_ERROR,
+			G_IO_ERROR_FAILED_HANDLED,
+			"Already processing a different method");
+}
+
+static void install_bundle_authorized(GDBusMethodInvocation *invocation, gpointer data)
+{
+	RaucInstallArgs *args = data;
+
+	if (r_context_get_busy()) {
+		install_reject_busy(invocation, args);
+		return;
+	}
+
+	r_config_file_modified_check();
+
+	r_installer_set_operation(r_installer, "installing");
+	g_dbus_interface_skeleton_flush(G_DBUS_INTERFACE_SKELETON(r_installer));
+	install_run(args);
+	r_installer_complete_install_bundle(r_installer, invocation);
+}
+
 static gboolean r_on_handle_install_bundle(
 		RInstaller *interface,
 		GDBusMethodInvocation *invocation,
@@ -87,16 +150,15 @@ static gboolean r_on_handle_install_bundle(
 	g_autoptr(GVariant) dict_rest = NULL;
 	GVariantIter iter;
 	gchar *key;
-	g_autofree gchar *message = NULL;
-	gboolean res;
+	gboolean override;
+	g_autoptr(GPtrArray) details = NULL;
 
 	g_print("input bundle: %s\n", source);
 
-	res = !r_context_get_busy();
-	if (!res) {
-		message = g_strdup("Already processing a different method");
-		args->status_result = 1;
-		goto out;
+	/* checked again once authorized */
+	if (r_context_get_busy()) {
+		install_reject_busy(invocation, args);
+		return TRUE;
 	}
 
 	args->name = g_strdup(source);
@@ -121,31 +183,43 @@ static gboolean r_on_handle_install_bundle(
 	dict_rest = g_variant_dict_end(&dict);
 	g_variant_iter_init(&iter, dict_rest);
 	while (g_variant_iter_next(&iter, "{sv}", &key, NULL)) {
-		message = g_strdup_printf("Unsupported key: %s", key);
-		g_free(key);
-		res = FALSE;
-		args->status_result = 2;
-		goto out;
-	}
-
-	r_config_file_modified_check();
-
-	r_installer_set_operation(r_installer, "installing");
-	g_dbus_interface_skeleton_flush(G_DBUS_INTERFACE_SKELETON(r_installer));
-	install_run(args);
-	args = NULL;
-
-out:
-	g_clear_pointer(&args, install_args_free);
-	if (res) {
-		r_installer_complete_install(interface, invocation);
-	} else {
-		r_installer_set_operation(r_installer, "idle");
 		g_dbus_method_invocation_return_error(invocation,
 				G_IO_ERROR,
 				G_IO_ERROR_FAILED_HANDLED,
-				"%s", message);
+				"Unsupported key: %s", key);
+		g_free(key);
+		args->status_result = 2;
+		install_args_free(args);
+		r_installer_set_operation(r_installer, "idle");
+		return TRUE;
 	}
+
+	/* the transaction ID can end up in HTTP headers and handlers */
+	override = args->ignore_compatible || args->ignore_version_limit ||
+	           args->transaction || access_args_overriding(&args->access_args);
+
+	details = g_ptr_array_new();
+	g_ptr_array_add(details, (gpointer) "source");
+	g_ptr_array_add(details, args->name);
+	g_ptr_array_add(details, (gpointer) "ignore-compatible");
+	g_ptr_array_add(details, (gpointer) (args->ignore_compatible ? "true" : "false"));
+	g_ptr_array_add(details, (gpointer) "ignore-version-limit");
+	g_ptr_array_add(details, (gpointer) (args->ignore_version_limit ? "true" : "false"));
+	add_access_args_details(details, &args->access_args);
+	if (args->transaction) {
+		g_ptr_array_add(details, (gpointer) "transaction-id");
+		g_ptr_array_add(details, args->transaction);
+	}
+	if (args->require_manifest_hash) {
+		g_ptr_array_add(details, (gpointer) "require-manifest-hash");
+		g_ptr_array_add(details, args->require_manifest_hash);
+	}
+	g_ptr_array_add(details, NULL);
+
+	r_authorize(invocation,
+			override ? "de.pengutronix.rauc.install-override" : "de.pengutronix.rauc.install",
+			(const gchar *const *) details->pdata, install_bundle_authorized, args,
+			(GDestroyNotify) install_args_refused);
 
 	return TRUE;
 }
