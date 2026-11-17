@@ -163,6 +163,12 @@ def have_service():
     return string_in_config_h("ENABLE_SERVICE 1")
 
 
+def have_polkit():
+    return string_in_config_h("ENABLE_POLKIT 1")
+
+
+needs_polkit = pytest.mark.skipif(not have_polkit(), reason="Missing polkit support")
+
 needs_emmc = pytest.mark.skipif("RAUC_TEST_EMMC" not in os.environ, reason="Missing eMMC")
 
 
@@ -372,6 +378,102 @@ def dbus_session_bus(tmp_path_factory):
     except subprocess.TimeoutExpired:
         dbus.kill()
         dbus.wait()
+
+
+POLKIT_ACTIONS = [
+    "de.pengutronix.rauc.install",
+    "de.pengutronix.rauc.install-override",
+    "de.pengutronix.rauc.inspect",
+    "de.pengutronix.rauc.inspect-override",
+    "de.pengutronix.rauc.mark",
+    "de.pengutronix.rauc.poll",
+]
+
+
+@pytest.fixture(scope="session")
+def mock_polkitd(tmp_path_factory):
+    """
+    Run python-dbusmock's polkitd on a private bus that stands in for the
+    system bus, so a service built with polkit can be tested unprivileged.
+    Yields a function that sets the actions polkitd allows.
+    """
+    if not have_polkit():
+        yield None
+        return
+
+    bus = polkitd = None
+    try:
+        bus = subprocess.Popen(
+            [
+                "dbus-daemon",
+                "--session",
+                f"--address=unix:path={tmp_path_factory.mktemp('system-bus')}/socket",
+                "--nofork",
+                "--print-address",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        os.environ["DBUS_SYSTEM_BUS_ADDRESS"] = bus.stdout.readline().strip()
+        polkitd = subprocess.Popen(["python3", "-m", "dbusmock", "--system", "--template", "polkitd"])
+
+        def gdbus(*args):
+            return subprocess.run(["gdbus", *args], check=False, capture_output=True, text=True)
+
+        authority = [
+            "--system",
+            "--dest",
+            "org.freedesktop.PolicyKit1",
+            "--object-path",
+            "/org/freedesktop/PolicyKit1/Authority",
+        ]
+        timeout = time.monotonic() + 5.0
+        while gdbus("introspect", *authority).returncode:
+            assert time.monotonic() < timeout, "mock polkitd did not appear"
+            time.sleep(0.1)
+
+        def allow(*actions):
+            res = gdbus("call", *authority, "--method", "org.freedesktop.DBus.Mock.SetAllowed", str(list(actions)))
+            assert res.returncode == 0, res.stderr
+
+        def calls():
+            """Return the (action id, details) of every CheckAuthorization since the last call."""
+            import dbus
+
+            conn = dbus.bus.BusConnection(os.environ["DBUS_SYSTEM_BUS_ADDRESS"])
+            mock = dbus.Interface(
+                conn.get_object("org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority"),
+                "org.freedesktop.DBus.Mock",
+            )
+            result = [
+                (str(args[1]), {str(k): str(v) for k, v in args[2].items()})
+                for _, args in mock.GetMethodCalls("CheckAuthorization")
+            ]
+            mock.ClearCalls()
+            conn.close()
+            return result
+
+        allow.pid = polkitd.pid
+        allow.calls = calls
+        yield allow
+    finally:
+        for proc in (polkitd, bus):
+            if proc:
+                proc.terminate()
+                proc.wait()
+        os.environ.pop("DBUS_SYSTEM_BUS_ADDRESS", None)
+
+
+@pytest.fixture(autouse=True)
+def polkit_allow(mock_polkitd):
+    """
+    Allow every RAUC action before each test, so tests not about authorization
+    behave as without polkit. Tests about it call the yielded function to
+    allow only some actions.
+    """
+    if mock_polkitd:
+        mock_polkitd(*POLKIT_ACTIONS)
+    yield mock_polkitd
 
 
 @pytest.fixture
