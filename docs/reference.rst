@@ -2130,6 +2130,121 @@ path (e.g. ``root=PARTUUID=0815``). If the ``root=`` kernel command line option 
 used, the symlink is resolved to the block device (e.g. ``/dev/mmcblk0p1``).
 
 
+.. _sec_ref_polkit:
+
+polkit Authorization
+~~~~~~~~~~~~~~~~~~~~
+
+When built with ``-Dpolkit=enabled``, the RAUC service asks `polkit
+<https://polkit.pages.freedesktop.org/polkit/>`_ before it runs a D-Bus method
+that changes the system.
+A caller polkit does not authorize gets an
+``org.freedesktop.DBus.Error.AccessDenied`` error, and nothing is done.
+If polkit cannot be reached, the call is refused as well, unless the caller is
+root.
+Methods and properties that only report state are not checked.
+
+The actions are defined in ``de.pengutronix.rauc.policy``.
+By default, only an administrator may perform them; as with any polkit
+action, the root user is always authorized.
+Rules in ``/etc/polkit-1/rules.d`` can grant them to other users or groups.
+The arguments of a call are passed to the rules as details, which a rule reads
+with ``action.lookup()``.
+
+``de.pengutronix.rauc.install``
+  :ref:`InstallBundle() <gdbus-method-de-pengutronix-rauc-Installer.InstallBundle>`
+  and ``Install()``, without any of the arguments that skip a check.
+
+``de.pengutronix.rauc.install-override``
+  :ref:`InstallBundle() <gdbus-method-de-pengutronix-rauc-Installer.InstallBundle>`
+  with ``ignore-compatible``, ``ignore-version-limit``, ``tls-no-verify``,
+  ``tls-cert``, ``tls-key``, ``tls-ca``, ``http-headers`` or ``transaction-id``
+  set.
+  It is a separate action so that a system can allow installing while refusing
+  to skip the checks its configuration sets up.
+  The TLS arguments are part of it because the service, running as root, reads
+  the files or PKCS#11 objects they name, and a CA given by the caller replaces
+  the configured one.
+  ``transaction-id`` is part of it because the service sends it as an HTTP
+  header when ``send-headers`` names it, and passes it to handlers as
+  ``RAUC_TRANSACTION_ID``.
+
+``de.pengutronix.rauc.inspect``
+  :ref:`InspectBundle() <gdbus-method-de-pengutronix-rauc-Installer.InspectBundle>`
+  and ``Info()``, without any of the arguments that supply TLS credentials or
+  headers.
+
+``de.pengutronix.rauc.inspect-override``
+  :ref:`InspectBundle() <gdbus-method-de-pengutronix-rauc-Installer.InspectBundle>`
+  with ``tls-no-verify``, ``tls-cert``, ``tls-key``, ``tls-ca`` or
+  ``http-headers`` set.
+  As with ``install-override``, it is a separate action because the service,
+  running as root, reads the files or PKCS#11 objects these name, and a CA
+  given by the caller replaces the configured one.
+
+``de.pengutronix.rauc.mark``
+  :ref:`Mark() <gdbus-method-de-pengutronix-rauc-Installer.Mark>`.
+
+The details passed with each action:
+
+``source`` (install, install-override, inspect, inspect-override)
+  The bundle path or URL.
+
+``ignore-compatible``, ``ignore-version-limit`` (install, install-override)
+  ``true`` or ``false``.
+
+``tls-no-verify``, ``tls-cert``, ``tls-key``, ``tls-ca``, ``http-headers`` (install, install-override, inspect, inspect-override)
+  ``true`` or ``false``: whether the argument was given.
+  The values are not passed: a header can hold a credential, and a PKCS#11
+  URI can carry a PIN.
+
+``transaction-id``, ``require-manifest-hash`` (install, install-override)
+  The value given, only if one was given.
+
+``state``, ``slot`` (mark)
+  The *state* and *slot_identifier* arguments as given, such as ``good`` and
+  ``booted``.
+
+The details are the caller's own arguments.
+Rules should compare them with exact values, such as
+``action.lookup("slot") == "booted"``.
+``source`` and ``slot`` are passed as given, not resolved: a path can contain
+``..`` or name a symbolic link, and a slot can be named by its slot name as
+well as by ``booted``, ``other`` or ``backup``, so a rule that refuses
+particular values can be bypassed.
+Allow exact values rather than refusing others.
+Flags are passed as the strings ``true`` and ``false``, so compare them with
+``== "true"``; both strings are true in a JavaScript condition.
+
+Some actions do more than their name suggests, depending on the system
+configuration:
+
+* ``Mark()`` with ``good`` and ``booted`` also marks the other slot bad when
+  ``prevent-late-fallback`` is set, although the details only name the booted
+  slot.
+* ``GetSlotStatus()``, which is not checked, mounts slots to read their status
+  when per-slot status files are used.
+
+A root caller is authorized without asking polkit, which would authorize root
+for every action anyway, so RAUC's own tools keep working while polkit is
+unavailable, during boot for instance.
+Every other caller is refused if ``de.pengutronix.rauc.policy`` is not
+installed.
+
+When polkit does not answer within 20 seconds (5 minutes when the caller allows
+interactive authorization), the call is refused.
+The non-interactive deadline is kept below the 25-second default D-Bus
+method-call timeout, so a caller sees the refusal rather than giving up first
+and leaving the action to run with no one waiting for the result.
+A caller that allows interactive authorization must raise its own call timeout
+to at least the interactive deadline, otherwise it may give up while the user
+is still authenticating; the action still runs once authorized.
+As a safety net, a caller that disconnects from the bus while its check is
+pending (for example a tool that gave up and exited) has the check cancelled,
+so the action is not carried out unwatched.
+Building with polkit needs polkit 0.119 or later; older versions authorize a
+caller that disconnects during the check (CVE-2021-3560).
+
 RAUC's Basic Update Procedure
 -----------------------------
 
