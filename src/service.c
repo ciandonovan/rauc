@@ -327,11 +327,21 @@ static gboolean r_on_handle_info(RInstaller *interface,
 	return r_on_handle_inspect_bundle(interface, invocation, arg_bundle, NULL);
 }
 
-static gboolean r_on_handle_mark(RInstaller *interface,
-		GDBusMethodInvocation  *invocation,
-		const gchar *arg_state,
-		const gchar *arg_slot_identifier)
+typedef struct {
+	gchar *state;
+	gchar *slot_identifier;
+} RMarkCall;
+
+static void mark_call_free(RMarkCall *call)
 {
+	g_free(call->state);
+	g_free(call->slot_identifier);
+	g_free(call);
+}
+
+static void mark_authorized(GDBusMethodInvocation *invocation, gpointer data)
+{
+	RMarkCall *call = data;
 	g_autofree gchar *slot_name = NULL;
 	g_autofree gchar *message = NULL;
 	gboolean res;
@@ -342,11 +352,11 @@ static gboolean r_on_handle_mark(RInstaller *interface,
 		goto out;
 	}
 
-	res = mark_run(arg_state, arg_slot_identifier, &slot_name, &message);
+	res = mark_run(call->state, call->slot_identifier, &slot_name, &message);
 
 out:
 	if (res) {
-		r_installer_complete_mark(interface, invocation, slot_name, message);
+		r_installer_complete_mark(r_installer, invocation, slot_name, message);
 	} else {
 		g_dbus_method_invocation_return_error(invocation,
 				G_IO_ERROR,
@@ -355,6 +365,36 @@ out:
 	}
 	if (message)
 		g_message("rauc mark: %s", message);
+	mark_call_free(call);
+}
+
+static gboolean r_on_handle_mark(RInstaller *interface,
+		GDBusMethodInvocation  *invocation,
+		const gchar *arg_state,
+		const gchar *arg_slot_identifier)
+{
+	RMarkCall *call;
+	const gchar *details[] = {
+		"state", arg_state,
+		"slot", arg_slot_identifier,
+		NULL,
+	};
+
+	/* checked again once authorized */
+	if (r_context_get_busy()) {
+		g_dbus_method_invocation_return_error(invocation,
+				G_IO_ERROR,
+				G_IO_ERROR_FAILED_HANDLED,
+				"already processing a different method");
+		g_message("rauc mark: already processing a different method");
+		return TRUE;
+	}
+
+	call = g_new0(RMarkCall, 1);
+	call->state = g_strdup(arg_state);
+	call->slot_identifier = g_strdup(arg_slot_identifier);
+	r_authorize(invocation, "de.pengutronix.rauc.mark", details,
+			mark_authorized, call, (GDestroyNotify) mark_call_free);
 
 	return TRUE;
 }
