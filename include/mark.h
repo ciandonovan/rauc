@@ -44,6 +44,20 @@ gboolean r_mark_bad(RaucSlot *slot, GError **error)
 G_GNUC_WARN_UNUSED_RESULT;
 
 /**
+ * Check the status of a slot and its children before activating it.
+ *
+ * @param slot_identifier String representation of slot identifier
+ *                        (e.g. "other" or the slot name)
+ * @param install_complete Return location for whether all of them are "ok"
+ *                         and from the same bundle
+ * @param meets_version_limit Return location for whether all of them are at
+ *                            or above min-bundle-version
+ */
+void r_mark_activation_checks(const gchar *slot_identifier,
+		gboolean *install_complete,
+		gboolean *meets_version_limit);
+
+/**
  * Mark a bootname slot.
  *
  * @param state String representation of slot state

@@ -2205,6 +2205,21 @@ The details passed with each action:
   The *state* and *slot_identifier* arguments as given, such as ``good`` and
   ``booted``.
 
+``install-complete``, ``meets-version-limit`` (mark, with state ``active`` only)
+  ``true`` or ``false``, worked out by the service from the slot status of
+  the slot named and each of its child slots that has one.
+  ``install-complete`` is ``true`` if every one of them is ``ok`` and was
+  written from the same bundle, so not left ``pending`` or holding an older
+  image by an install that was cut off.
+  ``meets-version-limit`` is ``true`` if every one of them records a bundle
+  version at or above ``min-bundle-version``, or none is configured.
+  Both are ``false`` for a slot with no status, such as one never installed.
+  An install that was cut off is only recorded with a central status file
+  (``statusfile`` or ``data-directory``), not with per-slot status files.
+  With ``activate-installed=false``, a rule can allow activating a slot just
+  installed, but not switching back to an older slot, which would skip the
+  version limit.
+
 The details are the caller's own arguments.
 Rules should compare them with exact values, such as
 ``action.lookup("slot") == "booted"``.

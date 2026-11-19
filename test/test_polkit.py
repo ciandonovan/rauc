@@ -188,6 +188,106 @@ def test_details_hide_tls_values(rauc_dbus_service_with_system, polkit_allow, bu
     assert mark == {"state": "good", "slot": "booted"}
 
 
+def slot_status(status, version, bundle="b1"):
+    return {"status": status, "bundle.version": version, "bundle.hash": bundle}
+
+
+@pytest.mark.parametrize(
+    "limit, status, slot, complete, meets",
+    [
+        ("2.0.0", {}, "other", "false", "false"),
+        ("2.0.0", {"rootfs.1": slot_status("ok", "2.0.0")}, "other", "true", "true"),
+        ("2.0.0", {"rootfs.1": slot_status("ok", "2.1.0")}, "rootfs.1", "true", "true"),
+        ("2.0.0", {"rootfs.1": slot_status("ok", "1.9.0")}, "other", "true", "false"),
+        ("2.0.0", {"rootfs.1": slot_status("pending", "2.0.0")}, "other", "false", "true"),
+        (
+            "2.0.0",
+            {"rootfs.1": slot_status("ok", "2.0.0"), "appfs.1": slot_status("pending", "2.0.0")},
+            "other",
+            "false",
+            "true",
+        ),
+        (
+            "2.0.0",
+            {"rootfs.1": slot_status("ok", "2.0.0"), "appfs.1": slot_status("ok", "1.0.0")},
+            "other",
+            "true",
+            "false",
+        ),
+        (
+            "2.0.0",
+            {"rootfs.1": slot_status("ok", "2.0.0", "b2"), "appfs.1": slot_status("ok", "2.0.0", "b1")},
+            "other",
+            "false",
+            "true",
+        ),
+        (None, {"rootfs.1": slot_status("ok", "1.0.0")}, "other", "true", "true"),
+    ],
+)
+def test_mark_active_details(
+    tmp_path, create_system_files, system, polkit_allow, limit, status, slot, complete, meets
+):
+    """Activating a slot passes whether it holds a complete install at or above the version limit."""
+    system.prepare_minimal_config()
+    system.config["system"]["data-directory"] = str(tmp_path / "data-dir")
+    if limit:
+        system.config["system"]["min-bundle-version"] = limit
+    system.write_config()
+    os.makedirs(tmp_path / "data-dir", exist_ok=True)
+    with open(tmp_path / "data-dir/central.raucs", "w") as f:
+        for name, keys in status.items():
+            f.write(f"[slot.{name}]\n")
+            f.writelines(f"{k}={v}\n" for k, v in keys.items())
+
+    with system.running_service("A"):
+        polkit_allow()
+        polkit_allow.calls()
+        with pytest.raises(DBusError, match="not authorized"):
+            system.proxy.Mark("active", slot)
+        with pytest.raises(DBusError, match="not authorized"):
+            system.proxy.Mark("good", "booted")
+
+        assert polkit_allow.calls() == [
+            (
+                "de.pengutronix.rauc.mark",
+                {"state": "active", "slot": slot, "install-complete": complete, "meets-version-limit": meets},
+            ),
+            ("de.pengutronix.rauc.mark", {"state": "good", "slot": "booted"}),
+        ]
+
+
+@pytest.mark.parametrize("cut_off", [False, True])
+def test_mark_active_details_after_install(tmp_path, create_system_files, system, polkit_allow, bundle, cut_off):
+    """After a restart, an install cut off at its second image is not complete, a full one is."""
+    system.prepare_minimal_config()
+    system.config["system"]["data-directory"] = str(tmp_path / "data-dir")
+    system.write_config()
+    if cut_off:
+        os.unlink(tmp_path / "images/appfs-1")
+        os.mkdir(tmp_path / "images/appfs-1")
+
+    with system.running_service("A"):
+        polkit_allow("de.pengutronix.rauc.install")
+        system.proxy.InstallBundle(bundle, {})
+        assert (wait_idle(system.proxy) != "") == cut_off
+
+    assert slot_written(tmp_path / "images/rootfs-1")
+    # running_service() keeps the stopped service, so it cannot start a second
+    system.service = None
+    system.proxy = None
+
+    with system.running_service("A"):
+        polkit_allow()
+        polkit_allow.calls()
+        with pytest.raises(DBusError, match="not authorized"):
+            system.proxy.Mark("active", "other")
+
+        ((action, details),) = polkit_allow.calls()
+
+    assert action == "de.pengutronix.rauc.mark"
+    assert details["install-complete"] == ("false" if cut_off else "true")
+
+
 def test_refused_when_polkit_does_not_answer(rauc_dbus_service_with_system, polkit_allow):
     polkit_allow("de.pengutronix.rauc.mark")
     os.kill(polkit_allow.pid, signal.SIGSTOP)
